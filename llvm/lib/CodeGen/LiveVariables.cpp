@@ -24,7 +24,7 @@
 // things like the stack pointer and condition codes.
 //
 //===----------------------------------------------------------------------===//
-
+#include <iostream>
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
@@ -126,6 +126,8 @@ void LiveVariables::MarkVirtRegAliveInBlock(VarInfo &VRInfo,
 
 void LiveVariables::HandleVirtRegUse(Register Reg, MachineBasicBlock *MBB,
                                      MachineInstr &MI) {
+
+  //std::cout<<"This is opcode "<<MI.getOpcode()<<std::endl;                                     
   assert(MRI->getVRegDef(Reg) && "Register use before def!");
 
   unsigned BBNum = MBB->getNumber();

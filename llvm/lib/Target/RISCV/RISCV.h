@@ -73,6 +73,9 @@ extern char &RISCVInitUndefID;
 FunctionPass *createRISCVMoveMergePass();
 void initializeRISCVMoveMergePass(PassRegistry &);
 
+FunctionPass *createRISCVRivosSpectreShieldPass();
+void initializeRISCVRivosSpectreShieldPassPass (PassRegistry &);
+
 FunctionPass *createRISCVPushPopOptimizationPass();
 void initializeRISCVPushPopOptPass(PassRegistry &);
 

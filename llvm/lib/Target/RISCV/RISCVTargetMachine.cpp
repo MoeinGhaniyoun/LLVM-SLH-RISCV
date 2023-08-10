@@ -384,6 +384,7 @@ void RISCVPassConfig::addMachineSSAOptimization() {
 }
 
 void RISCVPassConfig::addPreRegAlloc() {
+  addPass(createRISCVRivosSpectreShieldPass());
   addPass(createRISCVPreRAExpandPseudoPass());
   if (TM->getOptLevel() != CodeGenOpt::None)
     addPass(createRISCVMergeBaseOffsetOptPass());

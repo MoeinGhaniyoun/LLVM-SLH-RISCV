@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <iostream>
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -396,6 +397,7 @@ void MachineRegisterInfo::replaceRegWith(Register FromReg, Register ToReg) {
 /// register or null if none is found.  This assumes that the code is in SSA
 /// form, so there should only be one definition.
 MachineInstr *MachineRegisterInfo::getVRegDef(Register Reg) const {
+  //std::cout<<"Here is the reg num: "<<Reg<<std::endl;
   // Since we are in SSA form, we can use the first definition.
   def_instr_iterator I = def_instr_begin(Reg);
   assert((I.atEnd() || std::next(I) == def_instr_end()) &&

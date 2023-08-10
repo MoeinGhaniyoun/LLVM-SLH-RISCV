@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+//#include <iostream>
 #include "RISCVInstrInfo.h"
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "RISCV.h"
@@ -918,6 +919,9 @@ bool RISCVInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
   if (NumTerminators == 2 && std::prev(I)->getDesc().isConditionalBranch() &&
       I->getDesc().isUnconditionalBranch()) {
     parseCondBranch(*std::prev(I), TBB, Cond);
+    int NumExpOp = (*I).getNumExplicitOperands();
+    int NumOp = (*I).getNumOperands();
+    //std::cout<<" Explicit: "<<NumExpOp << " NumOperand: "<<NumOp<<std::endl;
     FBB = getBranchDestBlock(*I);
     return false;
   }

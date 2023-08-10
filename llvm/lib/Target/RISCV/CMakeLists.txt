@@ -42,6 +42,7 @@ add_llvm_target(RISCVCodeGen
   RISCVRVVInitUndef.cpp
   RISCVSubtarget.cpp
   RISCVTargetMachine.cpp
+  RISCVRivosSpectreShield.cpp
   RISCVTargetObjectFile.cpp
   RISCVTargetTransformInfo.cpp
   GISel/RISCVCallLowering.cpp
