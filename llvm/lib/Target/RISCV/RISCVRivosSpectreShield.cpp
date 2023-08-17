@@ -17,8 +17,11 @@
 /// https://googleprojectzero.blogspot.com/2018/01/reading-privileged-memory-with-side.html
 /// https://spectreattack.com/spectre.pdf
 ///
+/// This pass is the RISC-V version of Speculative Load Hardening. 
+/// Many parts of the original SLH are re-used here.
+/// Author: Moein Ghaniyoun
 //===----------------------------------------------------------------------===//
-#include <iostream>
+
 #include "RISCV.h"
 #include "MCTargetDesc/RISCVMCExpr.h"
 #include "RISCVInstrInfo.h"
@@ -74,7 +77,7 @@ STATISTIC(NumPostLoadRegsHardened,
 STATISTIC(NumCallsOrJumpsHardened,
           "Number of calls or jumps requiring extra hardening");
 STATISTIC(NumInstsInserted, "Number of instructions inserted");
-STATISTIC(NumLFENCEsInserted, "Number of lfence instructions inserted");
+STATISTIC(NumFENCEIsInserted, "Number of fence.i instructions inserted");
 
 
 static cl::opt<bool> EnableSpeculativeLoadHardening(
@@ -85,7 +88,7 @@ static cl::opt<bool> EnableSpeculativeLoadHardening(
 static cl::opt<bool> HardenEdgesWithFENCE(
     PASS_KEY "-fence",
     cl::desc(
-        "Use FENCE along each conditional edge to harden against speculative "
+        "Use FENCE_I along each conditional edge to harden against speculative "
         "loads rather than conditional_movs/non-speculative_loads/fake-branch-dependence."),
     cl::init(false), cl::Hidden);
 
@@ -168,19 +171,10 @@ private:
   SmallVector<MachineInstr *, 16>
   tracePredStateThroughCFG(MachineFunction &MF, ArrayRef<BlockCondInfo> Infos);
 
-  void unfoldCallAndJumpLoads(MachineFunction &MF);
-
   SmallVector<MachineInstr *, 16>
   tracePredStateThroughIndirectBranches(MachineFunction &MF);
 
   void tracePredStateThroughBlocksAndHarden(MachineFunction &MF);
-
-  unsigned saveEFLAGS(MachineBasicBlock &MBB,
-                      MachineBasicBlock::iterator InsertPt,
-                      const DebugLoc &Loc);
-  void restoreEFLAGS(MachineBasicBlock &MBB,
-                     MachineBasicBlock::iterator InsertPt, const DebugLoc &Loc,
-                     Register Reg);
 
   void mergePredStateIntoSP(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator InsertPt,
@@ -237,19 +231,19 @@ static RISCVCC::CondCode getCondFromBranchOpc(unsigned Opc) {
 
 static bool isRegLive(
   MachineBasicBlock &MBB, const TargetRegisterInfo &TRI, SmallVector<llvm::Register, 2> regs) {
-  // Check if EFLAGS are alive by seeing if there is a def of them or they
+  // Check if the regs are live by seeing if there is a def of them or they
   // live-in, and then seeing if that def is in turn used.
   for (MachineInstr &MI : MBB) {
     for (auto &reg : regs){
       if (MachineOperand *UseOp = MI.findRegisterUseOperand(reg)) {
-        // If the def is dead, then EFLAGS is not live.
+        // If the def is dead, then reg is not live.
         if (UseOp->isDead())
           return false;
 
         // Otherwise we've def'ed it, and it is live.
         return true;
       }
-      // While at this instruction, also check if we use and kill EFLAGS
+      // While at this instruction, also check if we use and kill regs
       // which means it isn't live.
       if (MI.killsRegister(reg, &TRI))
         return false;
@@ -365,10 +359,10 @@ static MachineBasicBlock &splitEdge(MachineBasicBlock &MBB,
 static bool hasVulnerableLoad(MachineFunction &MF) {
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
-      // Loads within this basic block after an LFENCE are not at risk of
+      // Loads within this basic block after an FENCE_I are not at risk of
       // speculatively executing with invalid predicates from prior control
       // flow. So break out of this block but continue scanning the function.
-      if (MI.getOpcode() == RISCV::FENCE)
+      if (MI.getOpcode() == RISCV::FENCE_I)
         break;
 
       // Looking for loads only.
@@ -477,37 +471,28 @@ bool RISCVRivosSpectreShieldPass::runOnMachineFunction(
   if (!HasVulnerableLoad && Infos.empty())
     return true;
 
-  // The poison value is required to be an all-ones value for many aspects of
-  // this mitigation.
-  /* const int PoisonVal = -1;
-  PS->PoisonReg = MRI->createVirtualRegister(PS->RC);
-  BuildMI(Entry, EntryInsertPt, Loc, TII->get(RISCV::ADDI), PS->PoisonReg)
-      .addReg(RISCV::X0)
-      .addImm(PoisonVal);
-  ++NumInstsInserted; */
-
   // If we have loads being hardened and we've asked for call and ret edges to
   // get a full fence-based mitigation, inject that fence.
   if (HasVulnerableLoad && FenceCallAndRet) {
-    // We need to insert an LFENCE at the start of the function to suspend any
+    // We need to insert an FENCE_I at the start of the function to suspend any
     // incoming misspeculation from the caller. This helps two-fold: the caller
     // may not have been protected as this code has been, and this code gets to
     // not take any specific action to protect across calls.
     // FIXME: We could skip this for functions which unconditionally return
     // a constant.
-    BuildMI(Entry, EntryInsertPt, Loc, TII->get(RISCV::FENCE));
+    BuildMI(Entry, EntryInsertPt, Loc, TII->get(RISCV::FENCE_I));
     ++NumInstsInserted;
-    ++NumLFENCEsInserted;
+    ++NumFENCEIsInserted;
   }
 
-  // If we guarded the entry with an LFENCE and have no conditionals to protect
+  // If we guarded the entry with an FENCE_I and have no conditionals to protect
   // in blocks, then we're done.
   if (FenceCallAndRet && Infos.empty())
     // We may have changed the function's code at this point to insert fences.
     return true;
 
   
-  // For every basic block in the function which can b
+  // Check if we need to harden beyond inter-procedures
   if (HardenInterprocedurally && !FenceCallAndRet) {
     // Set up the predicate state by extracting it from the incoming stack
     // pointer so we pick up any misspeculation in our caller.
@@ -516,7 +501,7 @@ bool RISCVRivosSpectreShieldPass::runOnMachineFunction(
     // Otherwise, just build the predicate state itself by zeroing a register
     // as we don't need any initial state.
     PS->InitialReg = MRI->createVirtualRegister(PS->RC);
-    auto ZeroI = BuildMI(Entry, EntryInsertPt, Loc, TII->get(RISCV::ADDI),
+    BuildMI(Entry, EntryInsertPt, Loc, TII->get(RISCV::ADDI),
                           PS->InitialReg)
                           .addReg(RISCV::X0)
                           .addImm(0);
@@ -537,7 +522,10 @@ bool RISCVRivosSpectreShieldPass::runOnMachineFunction(
   // Trace through the CFG.
   auto CMovs = tracePredStateThroughCFG(MF, Infos);
 
-  /*
+  // FIXME: Check whether we need something like this in RISCV
+  // Probably not though! Exception handling usually results in
+  // prv change and only a handful of registers are used
+  /* 
   // We may also enter basic blocks in this function via exception handling
   // control flow. Here, if we are hardening interprocedurally, we need to
   // re-capture the predicate state from the throwing code. In the Itanium ABI,
@@ -559,18 +547,12 @@ bool RISCVRivosSpectreShieldPass::runOnMachineFunction(
   }
   */
 
-  
   if (HardenIndirectCallsAndJumps) {
-    // If we are going to harden calls and jumps we need to unfold their memory
-    // operands.
-    //unfoldCallAndJumpLoads(MF);
-
-    // Then we trace predicate state through the indirect branches.
+    // Trace predicate state through the indirect branches.
     auto IndirectBrCMovs = tracePredStateThroughIndirectBranches(MF);
     CMovs.append(IndirectBrCMovs.begin(), IndirectBrCMovs.end());
   }
   
-
   // Now that we have the predicate state available at the start of each block
   // in the CFG, trace it through each block, hardening vulnerable instructions
   // as we go.
@@ -707,6 +689,7 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
     ++NumCondBranchesTraced;
     // Compute the non-conditional successor as either the target of any
     // unconditional branch or the layout successor.
+    // Each branch in RISCV has its successor in its last explicit operand
     MachineBasicBlock *UncondSucc =
         UncondBr ? (UncondBr->isUnconditionalBranch()
                         ? UncondBr->getOperand(UncondBr->getNumExplicitOperands()-1).getMBB()
@@ -733,12 +716,6 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
                   ? Succ
                   : splitEdge(MBB, Succ, SuccCount, Br, UncondBr, *TII);
 
-          /*
-          bool LiveEFLAGS = Succ.isLiveIn(X86::EFLAGS);
-          if (!LiveEFLAGS)
-            CheckingMBB.addLiveIn(X86::EFLAGS);
-          */
-          
           // Now insert the cmovs to implement the checks.
           auto InsertPt = CheckingMBB.begin();
           assert((InsertPt == CheckingMBB.end() || !InsertPt->isPHI()) &&
@@ -750,16 +727,11 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
           unsigned CurStateReg = PS->InitialReg;
 
           for (auto Cond : Conds) {
-            //int PredStateSizeInBytes = TRI->getRegSizeInBits(*PS->RC) / 8;
-            //auto CMovOp = X86::getCMovOpcode(PredStateSizeInBytes);
-
             //Add branch operands to the created basic block as live-ins
             MachineOperand &Operand1 = Cond.first->getOperand(0); 
             MachineOperand &Operand2 = Cond.first->getOperand(1); 
             Operand1.setIsKill(false);
             Operand2.setIsKill(false);
-
-
 
             llvm::MachineInstrBuilder XORBr;
             llvm::MachineInstrBuilder SLTBr;
@@ -771,6 +743,12 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
             Register NegReg = MRI->createVirtualRegister(PS->RC);
             Register UpdatedStateReg = MRI->createVirtualRegister(PS->RC);
             
+            // isBrCond == True: We are in Taken part of the branch
+            // isBrCond == False: We are in Not-Taken part of the branch 
+            // CMOV equivalent instructions are generated below
+            // This part can be updated to support other instructions
+            // Currently we use bitwise operations (AND,XOR,etc.) to replicate
+            // X86 CMOV.
             if ((isBrCond && Cond.second == RISCVCC::COND_EQ) || 
             (!isBrCond && Cond.second == RISCVCC::COND_NE)){
               XORBr = BuildMI(CheckingMBB, InsertPt, DebugLoc(),
@@ -853,24 +831,16 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
                               TII->get(RISCV::OR), UpdatedStateReg)
                              .addReg(CurStateReg)
                              .addReg(NegReg);
-
             
-            
-            /*             
-            // If this is the last cmov and the EFLAGS weren't originally
-            // live-in, mark them as killed.
-            if (!LiveEFLAGS && Cond == Conds.back())
-              CMovI->findRegisterUseOperand(X86::EFLAGS)->setIsKill(true);
-            */   
-
+            // FIXME: only one instruction is counted here
+            // Count all the added instructions
             ++NumInstsInserted;
-            //LLVM_DEBUG(dbgs() << "  Inserting cmov: "; CMovI->dump();
-                       //dbgs() << "\n");
+            LLVM_DEBUG(dbgs() << "  Inserting cmov: "; ORBr->dump();
+                       dbgs() << "\n");
 
-            // The first one of the cmovs will be using the top level
+            // The first one of the cmovs (here is ORBr) will be using the top level
             // `PredStateReg` and need to get rewritten into SSA form.
             if (CurStateReg == PS->InitialReg)
-              //CMovs.push_back(&*CMovI);
                 CMovs.push_back(&*ORBr);
 
             // The next cmov should start from this one's def.
@@ -889,10 +859,10 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
       RISCVCC::CondCode Cond = getCondFromBranchOpc(CondBr->getOpcode());
       UncondCodeSeq.push_back({CondBr, Cond});
 
-      // Check whether there is any instruction in the destination block that is dependent 
+      // FIXME: Check whether there is any instruction in the destination block that is dependent 
       // on the branch register operands. If not, we don't need to insert CMovs here
-      //FIXME: Only check loads in the destination block
-      //FIXME: Find a way to only check the operand that can be manipulated by untrusted user
+      // FIXME: Only check loads in the destination block
+      // FIXME: Find a way to only check the operand that can be manipulated by untrusted user
       //if (isRegLive(Succ, *TRI, {CondBr->getOperand(0).getReg(), CondBr->getOperand(1).getReg()})){
         BuildCheckingBlockForSuccAndConds(MBB, Succ, SuccCount, CondBr, UncondBr,
                                         {{CondBr, Cond}}, true);
@@ -925,7 +895,7 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
     UncondCodeSeq.erase(std::unique(UncondCodeSeq.begin(), UncondCodeSeq.end()),
                         UncondCodeSeq.end());
     
-    // Check whether there is any instruction in the destination block that is dependent 
+    // FIXME: Check whether there is any instruction in the destination block that is dependent 
     // on the branch register operands. If not, we don't need to insert CMovs here
     for (auto BrCondPair: UncondCodeSeq){
       //if (isRegLive(*UncondSucc, *TRI, {BrCondPair.first->getOperand(0).getReg(), BrCondPair.first->getOperand(1).getReg()})){
@@ -963,7 +933,7 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughCFG(
 /// strategies may interact -- later hardening may change what strategy we wish
 /// to use. We also will analyze data dependencies between loads and avoid
 /// hardening those loads that are data dependent on a load with a hardened
-/// address. We also skip hardening loads already behind an LFENCE as that is
+/// address. We also skip hardening loads already behind an FENCE_I as that is
 /// sufficient to harden them against misspeculation.
 ///
 /// Second, we actively trace the predicate state through the block, applying
@@ -989,7 +959,7 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughBlocksAndHarden(
     // The first pass over the block: collect all the loads which can have their
     // loaded value hardened and all the loads that instead need their address
     // hardened. During this walk we propagate load dependence for address
-    // hardened loads and also look for LFENCE to stop hardening wherever
+    // hardened loads and also look for FENCE_I to stop hardening wherever
     // possible. When deciding whether or not to harden the loaded value or not,
     // we check to see if any registers used in the address will have been
     // hardened at this point and if so, harden any remaining address registers
@@ -1005,7 +975,7 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughBlocksAndHarden(
       for (MachineInstr &MI : MBB) {
         // We naively assume that all def'ed registers of an instruction have
         // a data dependency on all of their operands.
-        // FIXME: Do a more careful analysis of x86 to build a conservative
+        // FIXME: Do a more careful analysis of riscv to build a conservative
         // model here.
         if (llvm::any_of(MI.uses(), [&](MachineOperand &Op) {
               return Op.isReg() && LoadDepRegs.test(Op.getReg());
@@ -1014,47 +984,20 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughBlocksAndHarden(
             if (Def.isReg())
               LoadDepRegs.set(Def.getReg());
 
-        // Both Intel and AMD are guiding that they will change the semantics of
-        // LFENCE to be a speculation barrier, so if we see an LFENCE, there is
-        // no more need to guard things in this block.
-        if (MI.getOpcode() == RISCV::FENCE)
+        
+        if (MI.getOpcode() == RISCV::FENCE_I)
           break;
         // If this instruction cannot load, nothing to do.
         if (!MI.mayLoad()){
           continue;
-        } //|| MI.getNumExplicitOperands() != 3)
+        } 
           
         
-        
-        /*
-        // Some instructions which "load" are trivially safe or unimportant.
-        
-        if (MI.getOpcode() == X86::MFENCE)
-          continue;
-        
-
-        // Extract the memory operand information about this instruction.
-        // FIXME: This doesn't handle loading pseudo instructions which we often
-        // could handle with similarly generic logic. We probably need to add an
-        // MI-layer routine similar to the MC-layer one we use here which maps
-        // pseudos much like this maps real instructions.
-        const MCInstrDesc &Desc = MI.getDesc();
-        int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
-        if (MemRefBeginIdx < 0) {
-          LLVM_DEBUG(dbgs()
-                         << "WARNING: unable to harden loading instruction: ";
-                     MI.dump());
-          continue;
-        }
-
-        MemRefBeginIdx += X86II::getOperandBias(Desc);
-        */
         MachineOperand *BaseMOPtr = &MI.getOperand(1);
         if (MI.getNumOperands() > 3){
           BaseMOPtr = &MI.getOperand(2);
         }
-        /*MachineOperand &IndexMO =
-            MI.getOperand(2);*/
+
         MachineOperand &BaseMO = *BaseMOPtr;
         // If we have at least one (non-frame-index, non-RIP) register operand,
         // and neither operand is load-dependent, we need to check the load.
@@ -1113,23 +1056,16 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughBlocksAndHarden(
 
         // Check if this is a load whose address needs to be hardened.
         if (HardenLoadAddr.erase(&MI)) {
-          /*
-          const MCInstrDesc &Desc = MI.getDesc();
-          int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
-          assert(MemRefBeginIdx >= 0 && "Cannot have an invalid index here!");
-
-          MemRefBeginIdx += X86II::getOperandBias(Desc);
-          */
+          
           MachineOperand *BaseMOPtr = &MI.getOperand(1);
+          // For instructions that mayLoad=1, but are regular loads. 
+          // examples include atomics like AMOSWAP, etc.
           if (MI.getNumOperands() > 3){
             BaseMOPtr = &MI.getOperand(2);
           }
         
           MachineOperand &BaseMO = *BaseMOPtr;
 
-          
-          /*MachineOperand &IndexMO =
-            MI.getOperand(2);*/
           hardenLoadAddr(MI, BaseMO, AddrRegToHardenedReg);
           continue;
         }
@@ -1218,7 +1154,7 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughBlocksAndHarden(
   }
 }
 
-/// Implements the naive hardening approach of putting an LFENCE after every
+/// Implements the naive hardening approach of putting an FENCE_I after every
 /// potentially mis-predicted control flow construct.
 ///
 /// We include this as an alternative mostly for the purpose of comparison. The
@@ -1250,9 +1186,13 @@ void RISCVRivosSpectreShieldPass::hardenEdgesWithFENCE(
 
   for (MachineBasicBlock *MBB : Blocks) {
     auto InsertPt = MBB->SkipPHIsAndLabels(MBB->begin());
-    BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(RISCV::FENCE));
+
+    /* BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(RISCV::FENCE))
+    .addImm(2)  //r
+    .addImm(3); //rw */
+    BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(RISCV::FENCE_I));
     ++NumInstsInserted;
-    ++NumLFENCEsInserted;
+    ++NumFENCEIsInserted;
   }
 }
 
@@ -1264,9 +1204,6 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
       
   MachineBasicBlock &MBB = *MI.getParent();
   const DebugLoc &Loc = MI.getDebugLoc(); 
-  // Check if EFLAGS are alive by seeing if there is a def of them or they
-  // live-in, and then seeing if that def is in turn used.
-  //bool EFLAGSLive = isEFLAGSLive(MBB, MI.getIterator(), *TRI);
 
   SmallVector<MachineOperand *, 2> HardenOpRegs;
   if (BaseMO.isFI()) {
@@ -1278,11 +1215,9 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
   } else if (BaseMO.getReg() == RISCV::SP) {
     // Some idempotent atomic operations are lowered directly to a locked
     // OR with 0 to the top of stack(or slightly offset from top) which uses an
-    // explicit RSP register as the base.
-    //assert(IndexMO.getReg() == X86::NoRegister &&
-    //       "Explicit RSP access with dynamic index!");
+    // explicit SP register as the base.
     LLVM_DEBUG(
-        dbgs() << "  Cannot harden base of explicit RSP offset in a load!");
+        dbgs() << "  Cannot harden base of explicit SP offset in a load!");
   } else if (BaseMO.getReg() == RISCV::NoRegister) {
     // For both RIP-relative addressed loads or absolute loads, we cannot
     // meaningfully harden them because the address being loaded has no
@@ -1310,18 +1245,8 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
     HardenOpRegs.push_back(&BaseMO);
   }
   
-  /*if (BaseMO.getReg() != RISCV::NoRegister &&
-      (HardenOpRegs.empty() ||
-       HardenOpRegs.front()->getReg() != BaseMO.getReg())){
-          HardenOpRegs.push_back(&BaseMO);
-  }
-  */
   assert((HardenOpRegs.size() == 0 || HardenOpRegs.size() == 1) &&
          "Should have exactly zero or 1 registers to harden!");
-
-  /* assert((HardenOpRegs.size() == 1 ||
-          HardenOpRegs[0]->getReg() != HardenOpRegs[1]->getReg()) &&
-         "Should not have two of the same registers!"); */
 
   // Remove any registers that have alreaded been checked.
   llvm::erase_if(HardenOpRegs, [&](MachineOperand *Op) {
@@ -1344,16 +1269,6 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
 
   auto InsertPt = MI.getIterator();
 
-  // If EFLAGS are live and we don't have access to instructions that avoid
-  // clobbering EFLAGS we need to save and restore them. This in turn makes
-  // the EFLAGS no longer live.
-  /*
-  unsigned FlagsReg = 0;
-  if (EFLAGSLive && !Subtarget->hasBMI2()) {
-    EFLAGSLive = false;
-    FlagsReg = saveEFLAGS(MBB, InsertPt, Loc);
-  }
-  */
   for (MachineOperand *Op : HardenOpRegs) {
     Register OpReg = Op->getReg();
     auto *OpRC = MRI->getRegClass(OpReg);
@@ -1363,7 +1278,6 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
                     .addReg(StateReg)
                     .addReg(OpReg);
     
-    //OrI->addRegisterDead(X86::EFLAGS, TRI);
     ++NumInstsInserted;
     LLVM_DEBUG(dbgs() << "  Inserting or: "; OrI->dump(); dbgs() << "\n");
     
@@ -1374,9 +1288,6 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
     Op->setReg(TmpReg);
     ++NumAddrRegsHardened;
   }
-  // And restore the flags if needed.
-  //if (FlagsReg)
-  //  restoreEFLAGS(MBB, InsertPt, Loc, FlagsReg);
 }
 
 
@@ -1389,12 +1300,12 @@ void RISCVRivosSpectreShieldPass::hardenLoadAddr(
 /// this paper:
 /// https://people.csail.mit.edu/vlk/spectre11.pdf
 ///
-/// We can harden this by introducing an LFENCE that will delay any load of the
+/// We can harden this by introducing an FENCE_I that will delay any load of the
 /// return address until prior instructions have retired (and thus are not being
 /// speculated), or we can harden the address used by the implicit load: the
 /// stack pointer.
 ///
-/// If we are not using an LFENCE, hardening the stack pointer has an additional
+/// If we are not using an FENCE_I, hardening the stack pointer has an additional
 /// benefit: it allows us to pass the predicate state accumulated in this
 /// function back to the caller. In the absence of a BCBS attack on the return,
 /// the caller will typically be resumed and speculatively executed due to the
@@ -1433,12 +1344,10 @@ void RISCVRivosSpectreShieldPass::mergePredStateIntoSP(
   auto ShiftI = BuildMI(MBB, InsertPt, Loc, TII->get(RISCV::SLLIW), TmpReg)
                     .addReg(PredStateReg, RegState::Kill)
                     .addImm(47);
-  //ShiftI->addRegisterDead(X86::EFLAGS, TRI);
   ++NumInstsInserted;
   auto OrI = BuildMI(MBB, InsertPt, Loc, TII->get(RISCV::OR), RISCV::X2)
-                 .addReg(RISCV::X2)
+                 .addReg(RISCV::X2) //X2 is SP
                  .addReg(TmpReg, RegState::Kill);
-  //OrI->addRegisterDead(X86::EFLAGS, TRI);
   ++NumInstsInserted;
 }
 
@@ -1459,7 +1368,6 @@ unsigned RISCVRivosSpectreShieldPass::extractPredStateFromSP(
       BuildMI(MBB, InsertPt, Loc, TII->get(RISCV::SRAIW), PredStateReg)
           .addReg(TmpReg, RegState::Kill)
           .addImm(TRI->getRegSizeInBits(*PS->RC) - 1);
-  //ShiftI->addRegisterDead(X86::EFLAGS, TRI);
   ++NumInstsInserted;
 
   return PredStateReg;
@@ -1512,9 +1420,9 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughCall(
     // in its entry. However, we do need to fence after the call returns.
     // Fencing before the return doesn't correctly handle cases where the return
     // itself is mispredicted.
-    BuildMI(MBB, std::next(InsertPt), Loc, TII->get(RISCV::FENCE));
+    BuildMI(MBB, std::next(InsertPt), Loc, TII->get(RISCV::FENCE_I));
     ++NumInstsInserted;
-    ++NumLFENCEsInserted;
+    ++NumFENCEIsInserted;
     return;
   }
 
@@ -1578,28 +1486,10 @@ void RISCVRivosSpectreShieldPass::tracePredStateThroughCall(
   }
 
   Register CurrentPCReg = MRI->createVirtualRegister(AddrRC);
-  
-  
  
   // Step past the call to handle when it returns.
   ++InsertPt;
 
-  /*
-  // If we didn't pre-compute the expected return address into a register, then
-  // red zones are enabled and the return address is still available on the
-  // stack immediately after the call. As the very first instruction, we load it
-  // into a register.
-  if (!ExpectedRetAddrReg) {
-    ExpectedRetAddrReg = MRI->createVirtualRegister(AddrRC);
-    BuildMI(MBB, InsertPt, Loc, TII->get(X86::MOV64rm), ExpectedRetAddrReg)
-        .addReg(X86::RSP //Base)
-        .addImm(1 //Scale)
-        .addReg(0 //Index)
-        .addImm(-8 //Displacement) // The stack pointer has been popped, so
-                                     // the return address is 8-bytes past it.
-        .addReg(0 //Segment);
-  }
-  */
 
   // Now we extract the callee's predicate state from the stack pointer.
   unsigned NewStateReg = extractPredStateFromSP(MBB, InsertPt, Loc);
@@ -1723,38 +1613,6 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughIndirectBranches(
       continue;
 
     unsigned TargetReg;
-    
-    /* switch (TI.getOpcode()) {
-    default:
-      // Direct branch or conditional branch (leading to fallthrough).
-      continue;
-
-    case X86::FARJMP16m:
-    case X86::FARJMP32m:
-    case X86::FARJMP64m:
-      // We cannot mitigate far jumps or calls, but we also don't expect them
-      // to be vulnerable to Spectre v1.2 or v2 (self trained) style attacks.
-      continue;
-
-    case X86::JMP16m:
-    case X86::JMP16m_NT:
-    case X86::JMP32m:
-    case X86::JMP32m_NT:
-    case X86::JMP64m:
-    case X86::JMP64m_NT:
-      // Mostly as documentation.
-      report_fatal_error("Memory operand jumps should have been unfolded!");
-
-    case X86::JMP16r:
-      report_fatal_error(
-          "Support for 16-bit indirect branches is not implemented.");
-    case X86::JMP32r:
-      report_fatal_error(
-          "Support for 32-bit indirect branches is not implemented.");
-
-    case X86::JMP64r:
-      TargetReg = TI.getOperand(0).getReg();
-    } */
 
     if (TI.isIndirectBranch()){
       TargetReg = TI.getOperand(1).getReg();
@@ -1910,6 +1768,8 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughIndirectBranches(
     Register SLTReg = MRI->createVirtualRegister(&RISCV::GPRRegClass);
     Register NegReg = MRI->createVirtualRegister(&RISCV::GPRRegClass);
     const MCObjectFileInfo *MOFI = MF.getContext().getObjectFileInfo();
+
+    // Check whether PIC is activated
     if (MOFI->isPositionIndependent()){
       BuildMI(MBB, InsertPt, DebugLoc(), TII->get(RISCV::PseudoLGA), MBBAddrReg)
           .addMBB(&MBB, RISCVII::MO_GOT_HI); 
@@ -1918,8 +1778,8 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughIndirectBranches(
       BuildMI(MBB, InsertPt, DebugLoc(), TII->get(RISCV::PseudoLLA), MBBAddrReg)
           .addMBB(&MBB, RISCVII::MO_GOT_HI); 
     }
-    /* BuildMI(MBB, InsertPt, DebugLoc(), TII->get(RISCV::PseudoLI), MBBAddrReg)
-            .addMBB(&MBB); */
+    
+    
     BuildMI(MBB, InsertPt, DebugLoc(), TII->get(RISCV::XOR), XORReg)
           .addReg(TargetReg, RegState::Kill)
           .addReg(MBBAddrReg, RegState::Kill);
@@ -1932,36 +1792,6 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughIndirectBranches(
     ++NumInstsInserted;
     //(void)CheckI;
     //LLVM_DEBUG(dbgs() << "  Inserting cmp: "; CheckI->dump(); dbgs() << "\n");
-
-    /* if (MF.getTarget().getCodeModel() == CodeModel::Small &&
-        !Subtarget->isPositionIndependent()) {
-      // Check directly against a relocated immediate when we can.
-      auto CheckI = BuildMI(MBB, InsertPt, DebugLoc(), TII->get(X86::CMP64ri32))
-                        .addReg(TargetReg, RegState::Kill)
-                        .addMBB(&MBB);
-      ++NumInstsInserted;
-      (void)CheckI;
-      LLVM_DEBUG(dbgs() << "  Inserting cmp: "; CheckI->dump(); dbgs() << "\n");
-    } else {
-      // Otherwise compute the address into a register first.
-      Register AddrReg = MRI->createVirtualRegister(&X86::GR64RegClass);
-      auto AddrI =
-          BuildMI(MBB, InsertPt, DebugLoc(), TII->get(X86::LEA64r), AddrReg)
-              .addReg(X86::RIP)
-              .addImm(1)
-              .addReg( 0)
-              .addMBB(&MBB)
-              .addReg(0);
-      ++NumInstsInserted;
-      (void)AddrI;
-      LLVM_DEBUG(dbgs() << "  Inserting lea: "; AddrI->dump(); dbgs() << "\n");
-      auto CheckI = BuildMI(MBB, InsertPt, DebugLoc(), TII->get(X86::CMP64rr))
-                        .addReg(TargetReg, RegState::Kill)
-                        .addReg(AddrReg, RegState::Kill);
-      ++NumInstsInserted;
-      (void)CheckI;
-      LLVM_DEBUG(dbgs() << "  Inserting cmp: "; CheckI->dump(); dbgs() << "\n");
-    } */
 
     // Now cmov over the predicate if the comparison wasn't equal.
     Register UpdatedStateReg = MRI->createVirtualRegister(PS->RC);
@@ -2009,20 +1839,7 @@ RISCVRivosSpectreShieldPass::tracePredStateThroughIndirectBranches(
 void RISCVRivosSpectreShieldPass::hardenIndirectCallOrJumpInstr(
     MachineInstr &MI,
     SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg) {
-  /* switch (MI.getOpcode()) {
-  case X86::FARCALL16m:
-  case X86::FARCALL32m:
-  case X86::FARCALL64m:
-  case X86::FARJMP16m:
-  case X86::FARJMP32m:
-  case X86::FARJMP64m:
-    // We don't need to harden either far calls or far jumps as they are
-    // safe from Spectre.
-    return;
-
-  default:
-    break;
-  } */
+ 
 
   // We should never see a loading instruction at this point, as those should
   // have been unfolded.
@@ -2086,32 +1903,12 @@ unsigned RISCVRivosSpectreShieldPass::hardenValueInRegister(
   assert((Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8) &&
          "Unknown register size");
 
-  // FIXME: Need to teach this about 32-bit mode.
-  /* if (Bytes != 8) {
-    unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
-    unsigned SubRegImm = SubRegImms[Log2_32(Bytes)];
-    Register NarrowStateReg = MRI->createVirtualRegister(RC);
-    BuildMI(MBB, InsertPt, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
-        .addReg(StateReg, 0, SubRegImm);
-    StateReg = NarrowStateReg;
-  } */
-
-  /* unsigned FlagsReg = 0;
-  if (isEFLAGSLive(MBB, InsertPt, *TRI))
-    FlagsReg = saveEFLAGS(MBB, InsertPt, Loc); */
-
   Register NewReg = MRI->createVirtualRegister(RC);
-  //unsigned OrOpCodes[] = {X86::OR8rr, X86::OR16rr, X86::OR32rr, X86::OR64rr};
-  //unsigned OrOpCode = OrOpCodes[Log2_32(Bytes)];
   auto OrI = BuildMI(MBB, InsertPt, Loc, TII->get(RISCV::OR), NewReg)
                  .addReg(StateReg)
                  .addReg(Reg);
-  //OrI->addRegisterDead(X86::EFLAGS, TRI);
   ++NumInstsInserted;
   LLVM_DEBUG(dbgs() << "  Inserting or: "; OrI->dump(); dbgs() << "\n");
-
-  /* if (FlagsReg)
-    restoreEFLAGS(MBB, InsertPt, Loc, FlagsReg); */
 
   return NewReg;
 }
